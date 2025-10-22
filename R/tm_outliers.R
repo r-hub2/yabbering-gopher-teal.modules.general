@@ -1,0 +1,1373 @@
+#' `teal` module: Outliers analysis
+#'
+#' Module to analyze and identify outliers using different methods
+#' such as IQR, Z-score, and Percentiles, and offers visualizations including
+#' box plots, density plots, and cumulative distribution plots to help interpret the outliers.
+#'
+#' @inheritParams teal::module
+#' @inheritParams shared_params
+#'
+#' @param outlier_var (`data_extract_spec` or `list` of multiple `data_extract_spec`)
+#' Specifies variable(s) to be analyzed for outliers.
+#' @param categorical_var (`data_extract_spec` or `list` of multiple `data_extract_spec`) optional,
+#' specifies the categorical variable(s) to split the selected outlier variables on.
+#' @param ggplot2_args `r roxygen_ggplot2_args_param("Boxplot", "Density Plot", "Cumulative Distribution Plot")`
+#'
+#' @inherit shared_params return
+#'
+#' @section Decorating Module:
+#'
+#' This module generates the following objects, which can be modified in place using decorators:
+#' - `box_plot` (`ggplot`)
+#' - `density_plot` (`ggplot`)
+#' - `cumulative_plot` (`ggplot`)
+#'
+#' A Decorator is applied to the specific output using a named list of `teal_transform_module` objects.
+#' The name of this list corresponds to the name of the output to which the decorator is applied.
+#' See code snippet below:
+#'
+#' ```
+#' tm_outliers(
+#'    ..., # arguments for module
+#'    decorators = list(
+#'      box_plot = teal_transform_module(...), # applied only to `box_plot` output
+#'      density_plot = teal_transform_module(...), # applied only to `density_plot` output
+#'      cumulative_plot = teal_transform_module(...) # applied only to `cumulative_plot` output
+#'    )
+#' )
+#' ```
+#'
+#' For additional details and examples of decorators, refer to the vignette
+#' `vignette("decorate-module-output", package = "teal.modules.general")`.
+#'
+#' To learn more please refer to the vignette
+#' `vignette("transform-module-output", package = "teal")` or the [`teal::teal_transform_module()`] documentation.
+#'
+#' @examplesShinylive
+#' library(teal.modules.general)
+#' interactive <- function() TRUE
+#' {{ next_example }}
+#' @examples
+#'
+#' # general data example
+#' data <- teal_data()
+#' data <- within(data, {
+#'   CO2 <- CO2
+#'   CO2[["primary_key"]] <- seq_len(nrow(CO2))
+#' })
+#' join_keys(data) <- join_keys(join_key("CO2", "CO2", "primary_key"))
+#'
+#' vars <- choices_selected(variable_choices(data[["CO2"]], c("Plant", "Type", "Treatment")))
+#'
+#' app <- init(
+#'   data = data,
+#'   modules = modules(
+#'     tm_outliers(
+#'       outlier_var = list(
+#'         data_extract_spec(
+#'           dataname = "CO2",
+#'           select = select_spec(
+#'             label = "Select variable:",
+#'             choices = variable_choices(data[["CO2"]], c("conc", "uptake")),
+#'             selected = "uptake",
+#'             multiple = FALSE,
+#'             fixed = FALSE
+#'           )
+#'         )
+#'       ),
+#'       categorical_var = list(
+#'         data_extract_spec(
+#'           dataname = "CO2",
+#'           filter = filter_spec(
+#'             vars = vars,
+#'             choices = value_choices(data[["CO2"]], vars$selected),
+#'             selected = value_choices(data[["CO2"]], vars$selected),
+#'             multiple = TRUE
+#'           )
+#'         )
+#'       )
+#'     )
+#'   )
+#' )
+#' if (interactive()) {
+#'   shinyApp(app$ui, app$server)
+#' }
+#'
+#' @examplesShinylive
+#' library(teal.modules.general)
+#' interactive <- function() TRUE
+#' {{ next_example }}
+#' @examples
+#'
+#' # CDISC data example
+#' data <- teal_data()
+#' data <- within(data, {
+#'   ADSL <- teal.data::rADSL
+#' })
+#' join_keys(data) <- default_cdisc_join_keys[names(data)]
+#'
+#' fact_vars_adsl <- names(Filter(isTRUE, sapply(data[["ADSL"]], is.factor)))
+#' vars <- choices_selected(variable_choices(data[["ADSL"]], fact_vars_adsl))
+#'
+#'
+#'
+#' app <- init(
+#'   data = data,
+#'   modules = modules(
+#'     tm_outliers(
+#'       outlier_var = list(
+#'         data_extract_spec(
+#'           dataname = "ADSL",
+#'           select = select_spec(
+#'             label = "Select variable:",
+#'             choices = variable_choices(data[["ADSL"]], c("AGE", "BMRKR1")),
+#'             selected = "AGE",
+#'             multiple = FALSE,
+#'             fixed = FALSE
+#'           )
+#'         )
+#'       ),
+#'       categorical_var = list(
+#'         data_extract_spec(
+#'           dataname = "ADSL",
+#'           filter = filter_spec(
+#'             vars = vars,
+#'             choices = value_choices(data[["ADSL"]], vars$selected),
+#'             selected = value_choices(data[["ADSL"]], vars$selected),
+#'             multiple = TRUE
+#'           )
+#'         )
+#'       )
+#'     )
+#'   )
+#' )
+#' if (interactive()) {
+#'   shinyApp(app$ui, app$server)
+#' }
+#'
+#' @export
+#'
+tm_outliers <- function(label = "Outliers Module",
+                        outlier_var,
+                        categorical_var = NULL,
+                        ggtheme = c("gray", "bw", "linedraw", "light", "dark", "minimal", "classic", "void"),
+                        ggplot2_args = teal.widgets::ggplot2_args(),
+                        plot_height = c(600, 200, 2000),
+                        plot_width = NULL,
+                        pre_output = NULL,
+                        post_output = NULL,
+                        transformators = list(),
+                        decorators = list()) {
+  message("Initializing tm_outliers")
+
+  # Normalize the parameters
+  if (inherits(outlier_var, "data_extract_spec")) outlier_var <- list(outlier_var)
+  if (inherits(categorical_var, "data_extract_spec")) categorical_var <- list(categorical_var)
+  if (inherits(ggplot2_args, "ggplot2_args")) ggplot2_args <- list(default = ggplot2_args)
+
+  # Start of assertions
+  checkmate::assert_string(label)
+  checkmate::assert_list(outlier_var, types = "data_extract_spec")
+
+  checkmate::assert_list(categorical_var, types = "data_extract_spec", null.ok = TRUE)
+  if (is.list(categorical_var)) {
+    lapply(categorical_var, function(x) {
+      if (length(x$filter) > 1L) {
+        stop("tm_outliers: categorical_var data_extract_specs may only specify one filter_spec", call. = FALSE)
+      }
+    })
+  }
+
+  ggtheme <- match.arg(ggtheme)
+
+  plot_choices <- c("Boxplot", "Density Plot", "Cumulative Distribution Plot")
+  checkmate::assert_list(ggplot2_args, types = "ggplot2_args")
+  checkmate::assert_subset(names(ggplot2_args), c("default", plot_choices))
+
+  checkmate::assert_numeric(plot_height, len = 3, any.missing = FALSE, finite = TRUE)
+  checkmate::assert_numeric(plot_height[1], lower = plot_height[2], upper = plot_height[3], .var.name = "plot_height")
+  checkmate::assert_numeric(plot_width, len = 3, any.missing = FALSE, null.ok = TRUE, finite = TRUE)
+  checkmate::assert_numeric(
+    plot_width[1],
+    lower = plot_width[2], upper = plot_width[3], null.ok = TRUE, .var.name = "plot_width"
+  )
+
+  checkmate::assert_multi_class(pre_output, c("shiny.tag", "shiny.tag.list", "html"), null.ok = TRUE)
+  checkmate::assert_multi_class(post_output, c("shiny.tag", "shiny.tag.list", "html"), null.ok = TRUE)
+
+  assert_decorators(decorators, names = c("box_plot", "density_plot", "cumulative_plot"))
+  # End of assertions
+
+  # Make UI args
+  args <- as.list(environment())
+
+  data_extract_list <- list(
+    outlier_var = outlier_var,
+    categorical_var = categorical_var
+  )
+
+
+  ans <- module(
+    label = label,
+    server = srv_outliers,
+    server_args = c(
+      data_extract_list,
+      list(
+        plot_height = plot_height, plot_width = plot_width, ggplot2_args = ggplot2_args,
+        decorators = decorators
+      )
+    ),
+    ui = ui_outliers,
+    ui_args = args,
+    transformators = transformators,
+    datanames = teal.transform::get_extract_datanames(data_extract_list)
+  )
+  attr(ans, "teal_bookmarkable") <- TRUE
+  ans
+}
+
+# UI function for the outliers module
+ui_outliers <- function(id, ...) {
+  args <- list(...)
+  ns <- NS(id)
+  is_single_dataset_value <- teal.transform::is_single_dataset(args$outlier_var, args$categorical_var)
+
+  teal.widgets::standard_layout(
+    output = teal.widgets::white_small_well(
+      uiOutput(ns("total_outliers")),
+      tags$div(
+        style = "overflow: auto;",
+        DT::dataTableOutput(ns("summary_table"))
+      ),
+      uiOutput(ns("total_missing")),
+      tags$br(), tags$hr(),
+      tabsetPanel(
+        id = ns("tabs"),
+        tabPanel(
+          "Boxplot",
+          teal.widgets::plot_with_settings_ui(id = ns("box_plot"))
+        ),
+        tabPanel(
+          "Density Plot",
+          teal.widgets::plot_with_settings_ui(id = ns("density_plot"))
+        ),
+        tabPanel(
+          "Cumulative Distribution Plot",
+          teal.widgets::plot_with_settings_ui(id = ns("cum_density_plot"))
+        )
+      ),
+      tags$br(), tags$hr(),
+      uiOutput(ns("table_ui_wrap")),
+      DT::dataTableOutput(ns("table_ui"))
+    ),
+    encoding = tags$div(
+      ### Reporter
+      teal.reporter::add_card_button_ui(ns("add_reporter"), label = "Add Report Card"),
+      tags$br(), tags$br(),
+      ###
+      tags$label("Encodings", class = "text-primary"),
+      teal.transform::datanames_input(args[c("outlier_var", "categorical_var")]),
+      teal.transform::data_extract_ui(
+        id = ns("outlier_var"),
+        label = "Variable",
+        data_extract_spec = args$outlier_var,
+        is_single_dataset = is_single_dataset_value
+      ),
+      if (!is.null(args$categorical_var)) {
+        teal.transform::data_extract_ui(
+          id = ns("categorical_var"),
+          label = "Categorical factor",
+          data_extract_spec = args$categorical_var,
+          is_single_dataset = is_single_dataset_value
+        )
+      },
+      conditionalPanel(
+        condition = paste0("input['", ns("tabs"), "'] == 'Boxplot'"),
+        teal.widgets::optionalSelectInput(
+          inputId = ns("boxplot_alts"),
+          label = "Plot type",
+          choices = c("Box plot", "Violin plot"),
+          selected = "Box plot",
+          multiple = FALSE
+        )
+      ),
+      shinyjs::hidden(checkboxInput(ns("split_outliers"), "Define outliers based on group splitting", value = FALSE)),
+      shinyjs::hidden(checkboxInput(ns("order_by_outlier"), "Re-order categories by outliers [by %]", value = FALSE)),
+      bslib::accordion(
+        open = TRUE,
+        bslib::accordion_panel(
+          title = "Method parameters",
+          collapsed = FALSE,
+          teal.widgets::optionalSelectInput(
+            inputId = ns("method"),
+            label = "Method",
+            choices = c("IQR", "Z-score", "Percentile"),
+            selected = "IQR",
+            multiple = FALSE
+          ),
+          conditionalPanel(
+            condition =
+              paste0("input['", ns("method"), "'] == 'IQR'"),
+            sliderInput(
+              ns("iqr_slider"),
+              "Outlier range:",
+              min = 1,
+              max = 5,
+              value = 3,
+              step = 0.5
+            )
+          ),
+          conditionalPanel(
+            condition =
+              paste0("input['", ns("method"), "'] == 'Z-score'"),
+            sliderInput(
+              ns("zscore_slider"),
+              "Outlier range:",
+              min = 1,
+              max = 5,
+              value = 3,
+              step = 0.5
+            )
+          ),
+          conditionalPanel(
+            condition =
+              paste0("input['", ns("method"), "'] == 'Percentile'"),
+            sliderInput(
+              ns("percentile_slider"),
+              "Outlier range:",
+              min = 0.001,
+              max = 0.5,
+              value = 0.01,
+              step = 0.001
+            )
+          ),
+          uiOutput(ns("ui_outlier_help"))
+        )
+      ),
+      conditionalPanel(
+        condition = paste0("input['", ns("tabs"), "'] == 'Boxplot'"),
+        ui_decorate_teal_data(
+          ns("d_box_plot"),
+          decorators = select_decorators(args$decorators, "box_plot")
+        )
+      ),
+      conditionalPanel(
+        condition = paste0("input['", ns("tabs"), "'] == 'Density Plot'"),
+        ui_decorate_teal_data(
+          ns("d_density_plot"),
+          decorators = select_decorators(args$decorators, "density_plot")
+        )
+      ),
+      conditionalPanel(
+        condition = paste0("input['", ns("tabs"), "'] == 'Cumulative Distribution Plot'"),
+        ui_decorate_teal_data(
+          ns("d_cumulative_plot"),
+          decorators = select_decorators(args$decorators, "cumulative_plot")
+        )
+      ),
+      bslib::accordion_panel(
+        title = "Plot settings",
+        selectInput(
+          inputId = ns("ggtheme"),
+          label = "Theme (by ggplot):",
+          choices = ggplot_themes,
+          selected = args$ggtheme,
+          multiple = FALSE
+        )
+      )
+    ),
+    forms = tagList(
+      teal.widgets::verbatim_popup_ui(ns("rcode"), "Show R code")
+    ),
+    pre_output = args$pre_output,
+    post_output = args$post_output
+  )
+}
+
+# Server function for the outliers module
+# Server function for the outliers module
+srv_outliers <- function(id, data, reporter, filter_panel_api, outlier_var,
+                         categorical_var, plot_height, plot_width, ggplot2_args, decorators) {
+  with_reporter <- !missing(reporter) && inherits(reporter, "Reporter")
+  with_filter <- !missing(filter_panel_api) && inherits(filter_panel_api, "FilterPanelAPI")
+  checkmate::assert_class(data, "reactive")
+  checkmate::assert_class(isolate(data()), "teal_data")
+  moduleServer(id, function(input, output, session) {
+    teal.logger::log_shiny_input_changes(input, namespace = "teal.modules.general")
+
+    ns <- session$ns
+
+    vars <- list(outlier_var = outlier_var, categorical_var = categorical_var)
+
+    rule_diff <- function(other) {
+      function(value) {
+        othervalue <- tryCatch(selector_list()[[other]]()[["select"]], error = function(e) NULL)
+        if (!is.null(othervalue) && identical(othervalue, value)) {
+          "`Variable` and `Categorical factor` cannot be the same"
+        }
+      }
+    }
+
+    selector_list <- teal.transform::data_extract_multiple_srv(
+      data_extract = vars,
+      datasets = data,
+      select_validation_rule = list(
+        outlier_var = shinyvalidate::compose_rules(
+          shinyvalidate::sv_required("Please select a variable"),
+          rule_diff("categorical_var")
+        ),
+        categorical_var = rule_diff("outlier_var")
+      )
+    )
+
+    iv_r <- reactive({
+      iv <- shinyvalidate::InputValidator$new()
+      iv$add_rule("method", shinyvalidate::sv_required("Please select a method"))
+      iv$add_rule("boxplot_alts", shinyvalidate::sv_required("Please select Plot Type"))
+      teal.transform::compose_and_enable_validators(iv, selector_list)
+    })
+
+    reactive_select_input <- reactive({
+      if (is.null(selector_list()$categorical_var) || length(selector_list()$categorical_var()$select) == 0) {
+        selector_list()[names(selector_list()) != "categorical_var"]
+      } else {
+        selector_list()
+      }
+    })
+
+    # Used to create outlier table and the dropdown with additional columns
+    dataname_first <- isolate(names(data())[[1]])
+
+    data_obj <- reactive({
+      obj <- data()
+      if (length(teal.data::join_keys(obj)) == 0) {
+        if (!".row_id" %in% names(obj[[dataname_first]])) {
+          obj[[dataname_first]]$.row_id <- seq_len(nrow(obj[[dataname_first]]))
+        }
+        teal.data::join_keys(obj) <-
+          teal.data::join_keys(teal.data::join_key(dataname_first, dataname_first, ".row_id"))
+      }
+      obj
+    })
+
+    anl_merged_input <- teal.transform::merge_expression_srv(
+      selector_list = reactive_select_input,
+      datasets = data_obj,
+      merge_function = "dplyr::inner_join"
+    )
+
+    anl_merged_q <- reactive({
+      req(anl_merged_input())
+      teal.code::eval_code(
+        data_obj(),
+        paste0(
+          'library("dplyr");library("tidyr");', # nolint quotes
+          'library("tibble");library("ggplot2");'
+        )
+      ) %>% # nolint quotes
+        teal.code::eval_code(as.expression(anl_merged_input()$expr))
+    })
+
+    merged <- list(
+      anl_input_r = anl_merged_input,
+      anl_q_r = anl_merged_q
+    )
+
+    n_outlier_missing <- reactive({
+      req(iv_r()$is_valid())
+      outlier_var <- as.vector(merged$anl_input_r()$columns_source$outlier_var)
+      ANL <- merged$anl_q_r()[["ANL"]]
+      sum(is.na(ANL[[outlier_var]]))
+    })
+
+    common_code_q <- reactive({
+      req(iv_r()$is_valid())
+
+      ANL <- merged$anl_q_r()[["ANL"]]
+      qenv <- merged$anl_q_r()
+
+      outlier_var <- as.vector(merged$anl_input_r()$columns_source$outlier_var)
+      categorical_var <- as.vector(merged$anl_input_r()$columns_source$categorical_var)
+      order_by_outlier <- input$order_by_outlier
+      method <- input$method
+      split_outliers <- input$split_outliers
+      teal::validate_has_data(
+        # missing values in the categorical variable may be used to form a category of its own
+        `if`(
+          length(categorical_var) == 0,
+          ANL,
+          ANL[, names(ANL) != categorical_var, drop = FALSE]
+        ),
+        min_nrow = 10,
+        complete = TRUE,
+        allow_inf = FALSE
+      )
+      validate(need(is.numeric(ANL[[outlier_var]]), "`Variable` is not numeric"))
+      validate(need(length(unique(ANL[[outlier_var]])) > 1, "Variable has no variation, i.e. only one unique value"))
+
+      # show/hide split_outliers
+      if (length(categorical_var) == 0) {
+        shinyjs::hide("split_outliers")
+        if (n_outlier_missing() > 0) {
+          qenv <- teal.code::eval_code(
+            qenv,
+            substitute(
+              expr = ANL <- ANL %>% dplyr::filter(!is.na(outlier_var_name)),
+              env = list(outlier_var_name = as.name(outlier_var))
+            )
+          )
+        }
+      } else {
+        validate(need(
+          is.factor(ANL[[categorical_var]]) ||
+            is.character(ANL[[categorical_var]]) ||
+            is.integer(ANL[[categorical_var]]),
+          "`Categorical factor` must be `factor`, `character`, or `integer`"
+        ))
+
+        if (n_outlier_missing() > 0) {
+          qenv <- teal.code::eval_code(
+            qenv,
+            substitute(
+              expr = ANL <- ANL %>% dplyr::filter(!is.na(outlier_var_name)),
+              env = list(outlier_var_name = as.name(outlier_var))
+            )
+          )
+        }
+        shinyjs::show("split_outliers")
+      }
+
+      # slider
+      outlier_definition_param <- if (method == "IQR") {
+        input$iqr_slider
+      } else if (method == "Z-score") {
+        input$zscore_slider
+      } else if (method == "Percentile") {
+        input$percentile_slider
+      }
+
+      # this is utils function that converts a %>% NULL %>% b into a %>% b
+      remove_pipe_null <- function(x) {
+        if (length(x) == 1) {
+          x
+        } else if (identical(x[[1]], as.name("%>%")) && is.null(x[[3]])) {
+          remove_pipe_null(x[[2]])
+        } else {
+          as.call(c(x[[1]], lapply(x[-1], remove_pipe_null)))
+        }
+      }
+
+      qenv <- teal.code::eval_code(
+        qenv,
+        substitute(
+          expr = {
+            ANL_OUTLIER <- ANL %>%
+              group_expr %>% # styler: off
+              dplyr::mutate(is_outlier = {
+                q1_q3 <- stats::quantile(outlier_var_name, probs = c(0.25, 0.75))
+                iqr <- q1_q3[2] - q1_q3[1]
+                !(outlier_var_name >= q1_q3[1] - 1.5 * iqr & outlier_var_name <= q1_q3[2] + 1.5 * iqr)
+              }) %>%
+              calculate_outliers %>% # styler: off
+              ungroup_expr %>% # styler: off
+              dplyr::filter(is_outlier | is_outlier_selected) %>%
+              dplyr::select(-is_outlier)
+          },
+          env = list(
+            calculate_outliers = if (method == "IQR") {
+              substitute(
+                expr = dplyr::mutate(is_outlier_selected = {
+                  q1_q3 <- stats::quantile(outlier_var_name, probs = c(0.25, 0.75))
+                  iqr <- q1_q3[2] - q1_q3[1]
+                  !(
+                    outlier_var_name >= q1_q3[1] - outlier_definition_param * iqr &
+                      outlier_var_name <= q1_q3[2] + outlier_definition_param * iqr
+                  )
+                }),
+                env = list(
+                  outlier_var_name = as.name(outlier_var),
+                  outlier_definition_param = outlier_definition_param
+                )
+              )
+            } else if (method == "Z-score") {
+              substitute(
+                expr = dplyr::mutate(
+                  is_outlier_selected = abs(outlier_var_name - mean(outlier_var_name)) /
+                    stats::sd(outlier_var_name) > outlier_definition_param
+                ),
+                env = list(
+                  outlier_var_name = as.name(outlier_var),
+                  outlier_definition_param = outlier_definition_param
+                )
+              )
+            } else if (method == "Percentile") {
+              substitute(
+                expr = dplyr::mutate(
+                  is_outlier_selected = outlier_var_name < stats::quantile(outlier_var_name, outlier_definition_param) |
+                    outlier_var_name > stats::quantile(outlier_var_name, 1 - outlier_definition_param)
+                ),
+                env = list(
+                  outlier_var_name = as.name(outlier_var),
+                  outlier_definition_param = outlier_definition_param
+                )
+              )
+            },
+            outlier_var_name = as.name(outlier_var),
+            group_expr = if (isTRUE(split_outliers) && length(categorical_var) != 0) {
+              substitute(dplyr::group_by(x), list(x = as.name(categorical_var)))
+            },
+            ungroup_expr = if (isTRUE(split_outliers) && length(categorical_var) != 0) {
+              substitute(dplyr::ungroup())
+            }
+          )
+        ) %>%
+          remove_pipe_null()
+      )
+
+      # ANL_OUTLIER_EXTENDED is the base table
+      join_keys <- as.character(teal.data::join_keys(data_obj())[dataname_first, dataname_first])
+
+      if (length(join_keys) == 1 && join_keys == ".row_id") {
+        # Dummy join key - single dataset, no join needed
+        qenv <- teal.code::eval_code(qenv, quote(ANL_OUTLIER_EXTENDED <- ANL_OUTLIER))
+      } else {
+        # Join keys exist - perform left join
+        qenv <- teal.code::eval_code(
+          qenv,
+          substitute(
+            expr = {
+              ANL_OUTLIER_EXTENDED <- dplyr::left_join(
+                ANL_OUTLIER,
+                dplyr::select(
+                  dataname,
+                  dplyr::setdiff(names(dataname), dplyr::setdiff(names(ANL_OUTLIER), join_keys))
+                ),
+                by = join_keys
+              )
+            },
+            env = list(
+              dataname = as.name(dataname_first),
+              join_keys = join_keys
+            )
+          )
+        )
+      }
+
+      qenv <- if (length(categorical_var) > 0) {
+        qenv <- teal.code::eval_code(
+          qenv,
+          substitute(
+            expr = summary_data_pre <- ANL_OUTLIER %>%
+              dplyr::filter(is_outlier_selected) %>%
+              dplyr::select(outlier_var_name, categorical_var_name) %>%
+              dplyr::group_by(categorical_var_name) %>%
+              dplyr::summarise(n_outliers = dplyr::n()) %>%
+              dplyr::right_join(
+                ANL %>%
+                  dplyr::select(outlier_var_name, categorical_var_name) %>%
+                  dplyr::group_by(categorical_var_name) %>%
+                  dplyr::summarise(
+                    total_in_cat = dplyr::n(),
+                    n_na = sum(is.na(outlier_var_name) | is.na(categorical_var_name))
+                  ),
+                by = categorical_var
+              ) %>%
+              # This is important as there may be categorical variables with natural orderings, e.g. AGE.
+              # The plots should be displayed by default in increasing order in these situations.
+              # dplyr::arrange will sort integer, factor, and character data types in the expected way.
+              dplyr::arrange(categorical_var_name) %>%
+              dplyr::mutate(
+                n_outliers = dplyr::if_else(is.na(n_outliers), 0, as.numeric(n_outliers)),
+                display_str = dplyr::if_else(
+                  n_outliers > 0,
+                  sprintf("%d [%.02f%%]", n_outliers, 100 * n_outliers / total_in_cat),
+                  "0"
+                ),
+                display_str_na = dplyr::if_else(
+                  n_na > 0,
+                  sprintf("%d [%.02f%%]", n_na, 100 * n_na / total_in_cat),
+                  "0"
+                ),
+                order = seq_along(n_outliers)
+              ),
+            env = list(
+              categorical_var = categorical_var,
+              categorical_var_name = as.name(categorical_var),
+              outlier_var_name = as.name(outlier_var)
+            )
+          )
+        )
+        # now to handle when user chooses to order based on amount of outliers
+        if (order_by_outlier) {
+          qenv <- teal.code::eval_code(
+            qenv,
+            quote(
+              summary_data_pre <- summary_data_pre %>%
+                dplyr::arrange(desc(n_outliers / total_in_cat)) %>%
+                dplyr::mutate(order = seq_len(nrow(summary_data_pre)))
+            )
+          )
+        }
+
+        teal.code::eval_code(
+          qenv,
+          substitute(
+            expr = {
+              # In order for geom_rug to work properly when reordering takes place inside facet_grid,
+              # all tables must have the column used for reording.
+              # In this case, the column used for reordering is `order`.
+              ANL_OUTLIER <- dplyr::left_join(
+                ANL_OUTLIER,
+                summary_data_pre[, c("order", categorical_var)],
+                by = categorical_var
+              )
+              # so that x axis of plot aligns with columns of summary table, from most outliers to least by percentage
+              ANL <- ANL %>%
+                dplyr::left_join(
+                  dplyr::select(summary_data_pre, categorical_var_name, order),
+                  by = categorical_var
+                ) %>%
+                dplyr::arrange(order)
+              summary_data <- summary_data_pre %>%
+                dplyr::select(
+                  categorical_var_name,
+                  Outliers = display_str, Missings = display_str_na, Total = total_in_cat
+                ) %>%
+                dplyr::mutate_all(as.character) %>%
+                tidyr::pivot_longer(-categorical_var_name) %>%
+                tidyr::pivot_wider(names_from = categorical_var, values_from = value) %>%
+                tibble::column_to_rownames("name")
+            },
+            env = list(
+              categorical_var = categorical_var,
+              categorical_var_name = as.name(categorical_var)
+            )
+          )
+        )
+      } else {
+        within(qenv, summary_data <- data.frame())
+      }
+
+      # Generate decoratable object from data
+      qenv <- within(qenv, {
+        table <- rtables::df_to_tt(summary_data)
+        table
+      })
+
+      if (length(categorical_var) > 0 && nrow(qenv[["ANL_OUTLIER"]]) > 0) {
+        shinyjs::show("order_by_outlier")
+      } else {
+        shinyjs::hide("order_by_outlier")
+      }
+
+      qenv
+    })
+
+    # boxplot/violinplot # nolint commented_code
+    box_plot_q <- reactive({
+      req(common_code_q())
+      ANL <- common_code_q()[["ANL"]]
+      ANL_OUTLIER <- common_code_q()[["ANL_OUTLIER"]]
+
+      outlier_var <- as.vector(merged$anl_input_r()$columns_source$outlier_var)
+      categorical_var <- as.vector(merged$anl_input_r()$columns_source$categorical_var)
+
+      # validation
+      teal::validate_has_data(ANL, 1)
+
+      # boxplot
+      plot_call <- quote(ANL %>% ggplot())
+
+      plot_call <- if (input$boxplot_alts == "Box plot") {
+        substitute(expr = plot_call + ggplot2::geom_boxplot(outlier.shape = NA), env = list(plot_call = plot_call))
+      } else if (input$boxplot_alts == "Violin plot") {
+        substitute(expr = plot_call + ggplot2::geom_violin(), env = list(plot_call = plot_call))
+      } else {
+        NULL
+      }
+
+      plot_call <- if (identical(categorical_var, character(0)) || is.null(categorical_var)) {
+        inner_call <- substitute(
+          expr = plot_call +
+            ggplot2::aes(x = "Entire dataset", y = outlier_var_name) +
+            ggplot2::scale_x_discrete(),
+          env = list(plot_call = plot_call, outlier_var_name = as.name(outlier_var))
+        )
+        if (nrow(ANL_OUTLIER) > 0) {
+          substitute(
+            expr = inner_call + ggplot2::geom_point(
+              data = ANL_OUTLIER,
+              ggplot2::aes(x = "Entire dataset", y = outlier_var_name, color = is_outlier_selected)
+            ),
+            env = list(inner_call = inner_call, outlier_var_name = as.name(outlier_var))
+          )
+        } else {
+          inner_call
+        }
+      } else {
+        substitute(
+          expr = plot_call +
+            ggplot2::aes(y = outlier_var_name, x = reorder(categorical_var_name, order)) +
+            ggplot2::xlab(categorical_var) +
+            ggplot2::scale_x_discrete() +
+            ggplot2::geom_point(
+              data = ANL_OUTLIER,
+              ggplot2::aes(x = as.factor(categorical_var_name), y = outlier_var_name, color = is_outlier_selected)
+            ),
+          env = list(
+            plot_call = plot_call,
+            outlier_var_name = as.name(outlier_var),
+            categorical_var_name = as.name(categorical_var),
+            categorical_var = categorical_var
+          )
+        )
+      }
+
+      dev_ggplot2_args <- teal.widgets::ggplot2_args(
+        labs = list(color = "Is outlier?"),
+        theme = list(legend.position = "top")
+      )
+
+      all_ggplot2_args <- teal.widgets::resolve_ggplot2_args(
+        user_plot = ggplot2_args[["Boxplot"]],
+        user_default = ggplot2_args$default,
+        module_plot = dev_ggplot2_args
+      )
+
+      parsed_ggplot2_args <- teal.widgets::parse_ggplot2_args(
+        all_ggplot2_args,
+        ggtheme = input$ggtheme
+      )
+
+      teal.code::eval_code(
+        common_code_q(),
+        substitute(
+          expr = box_plot <- plot_call +
+            ggplot2::scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+            labs + ggthemes + themes,
+          env = list(
+            plot_call = plot_call,
+            labs = parsed_ggplot2_args$labs,
+            ggthemes = parsed_ggplot2_args$ggtheme,
+            themes = parsed_ggplot2_args$theme
+          )
+        )
+      )
+    })
+
+    # density plot
+    density_plot_q <- reactive({
+      ANL <- common_code_q()[["ANL"]]
+      ANL_OUTLIER <- common_code_q()[["ANL_OUTLIER"]]
+
+      outlier_var <- as.vector(merged$anl_input_r()$columns_source$outlier_var)
+      categorical_var <- as.vector(merged$anl_input_r()$columns_source$categorical_var)
+
+      # validation
+      teal::validate_has_data(ANL, 1)
+      # plot
+      plot_call <- substitute(
+        expr = ANL %>%
+          ggplot2::ggplot(ggplot2::aes(x = outlier_var_name)) +
+          ggplot2::geom_density() +
+          ggplot2::geom_rug(data = ANL_OUTLIER, ggplot2::aes(x = outlier_var_name, color = is_outlier_selected)) +
+          ggplot2::scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")),
+        env = list(outlier_var_name = as.name(outlier_var))
+      )
+
+      plot_call <- if (identical(categorical_var, character(0)) || is.null(categorical_var)) {
+        substitute(expr = plot_call, env = list(plot_call = plot_call))
+      } else {
+        substitute(
+          expr = plot_call + ggplot2::facet_grid(~ reorder(categorical_var_name, order)),
+          env = list(plot_call = plot_call, categorical_var_name = as.name(categorical_var))
+        )
+      }
+
+      dev_ggplot2_args <- teal.widgets::ggplot2_args(
+        labs = list(color = "Is outlier?"),
+        theme = list(legend.position = "top")
+      )
+
+      all_ggplot2_args <- teal.widgets::resolve_ggplot2_args(
+        user_plot = ggplot2_args[["Density Plot"]],
+        user_default = ggplot2_args$default,
+        module_plot = dev_ggplot2_args
+      )
+
+      parsed_ggplot2_args <- teal.widgets::parse_ggplot2_args(
+        all_ggplot2_args,
+        ggtheme = input$ggtheme
+      )
+
+      teal.code::eval_code(
+        common_code_q(),
+        substitute(
+          expr = density_plot <- plot_call + labs + ggthemes + themes,
+          env = list(
+            plot_call = plot_call,
+            labs = parsed_ggplot2_args$labs,
+            themes = parsed_ggplot2_args$theme,
+            ggthemes = parsed_ggplot2_args$ggtheme
+          )
+        )
+      )
+    })
+
+    # Cumulative distribution plot
+    cumulative_plot_q <- reactive({
+      qenv <- common_code_q()
+
+      ANL <- qenv[["ANL"]]
+      ANL_OUTLIER <- qenv[["ANL_OUTLIER"]]
+
+      outlier_var <- as.vector(merged$anl_input_r()$columns_source$outlier_var)
+      categorical_var <- as.vector(merged$anl_input_r()$columns_source$categorical_var)
+
+      # validation
+      teal::validate_has_data(ANL, 1)
+
+      # plot
+      plot_call <- substitute(
+        expr = ANL %>% ggplot2::ggplot(ggplot2::aes(x = outlier_var_name)) +
+          ggplot2::stat_ecdf(),
+        env = list(outlier_var_name = as.name(outlier_var))
+      )
+      if (length(categorical_var) == 0) {
+        qenv <- teal.code::eval_code(
+          qenv,
+          substitute(
+            expr = {
+              ecdf_df <- ANL %>%
+                dplyr::mutate(
+                  y = stats::ecdf(ANL[[outlier_var]])(ANL[[outlier_var]])
+                )
+
+              outlier_points <- dplyr::left_join(
+                ecdf_df,
+                ANL_OUTLIER,
+                by = dplyr::setdiff(names(ecdf_df), "y")
+              ) %>%
+                dplyr::filter(!is.na(is_outlier_selected))
+            },
+            env = list(outlier_var = outlier_var)
+          )
+        )
+      } else {
+        qenv <- teal.code::eval_code(
+          qenv,
+          substitute(
+            expr = {
+              all_categories <- lapply(
+                unique(ANL[[categorical_var]]),
+                function(x) {
+                  ANL <- ANL %>% dplyr::filter(get(categorical_var) == x)
+                  anl_outlier2 <- ANL_OUTLIER %>% dplyr::filter(get(categorical_var) == x)
+                  ecdf_df <- ANL %>%
+                    dplyr::mutate(y = stats::ecdf(ANL[[outlier_var]])(ANL[[outlier_var]]))
+
+                  dplyr::left_join(
+                    ecdf_df,
+                    anl_outlier2,
+                    by = dplyr::setdiff(names(ecdf_df), "y")
+                  ) %>%
+                    dplyr::filter(!is.na(is_outlier_selected))
+                }
+              )
+              outlier_points <- do.call(rbind, all_categories)
+            },
+            env = list(categorical_var = categorical_var, outlier_var = outlier_var)
+          )
+        )
+        plot_call <- substitute(
+          expr = plot_call + ggplot2::facet_grid(~ reorder(categorical_var_name, order)),
+          env = list(plot_call = plot_call, categorical_var_name = as.name(categorical_var))
+        )
+      }
+
+      dev_ggplot2_args <- teal.widgets::ggplot2_args(
+        labs = list(color = "Is outlier?"),
+        theme = list(legend.position = "top")
+      )
+
+      all_ggplot2_args <- teal.widgets::resolve_ggplot2_args(
+        user_plot = ggplot2_args[["Cumulative Distribution Plot"]],
+        user_default = ggplot2_args$default,
+        module_plot = dev_ggplot2_args
+      )
+
+      parsed_ggplot2_args <- teal.widgets::parse_ggplot2_args(
+        all_ggplot2_args,
+        ggtheme = input$ggtheme
+      )
+
+      teal.code::eval_code(
+        qenv,
+        substitute(
+          expr = cumulative_plot <- plot_call +
+            ggplot2::geom_point(
+              data = outlier_points,
+              ggplot2::aes(x = outlier_var_name, y = y, color = is_outlier_selected)
+            ) +
+            ggplot2::scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+            labs + ggthemes + themes,
+          env = list(
+            plot_call = plot_call,
+            outlier_var_name = as.name(outlier_var),
+            labs = parsed_ggplot2_args$labs,
+            themes = parsed_ggplot2_args$theme,
+            ggthemes = parsed_ggplot2_args$ggtheme
+          )
+        )
+      )
+    })
+
+    current_tab_r <- reactive({
+      switch(req(input$tabs),
+        "Boxplot" = "box_plot",
+        "Density Plot" = "density_plot",
+        "Cumulative Distribution Plot" = "cumulative_plot"
+      )
+    })
+
+    decorated_q <- mapply(
+      function(obj_name, q) {
+        srv_decorate_teal_data(
+          id = sprintf("d_%s", obj_name),
+          data = q,
+          decorators = select_decorators(decorators, obj_name),
+          expr = reactive({
+            substitute(
+              expr = {
+                columns_index <- union(
+                  setdiff(names(ANL_OUTLIER), c("is_outlier_selected", "order")),
+                  table_columns
+                )
+                ANL_OUTLIER_EXTENDED[ANL_OUTLIER_EXTENDED$is_outlier_selected, columns_index]
+                print(.plot)
+              },
+              env = list(table_columns = input$table_ui_columns, .plot = as.name(obj_name))
+            )
+          }),
+          expr_is_reactive = TRUE
+        )
+      },
+      stats::setNames(nm = c("box_plot", "density_plot", "cumulative_plot")),
+      c(box_plot_q, density_plot_q, cumulative_plot_q)
+    )
+
+    decorated_final_q <- reactive(decorated_q[[req(current_tab_r())]]())
+
+    summary_table_r <- reactive({
+      q <- req(decorated_final_q())
+
+      list(
+        html = DT::datatable(
+          data = if (iv_r()$is_valid()) {
+            categorical_var <- as.vector(merged$anl_input_r()$columns_source$categorical_var)
+            if (!is.null(categorical_var)) q[["summary_data"]]
+          },
+          option = list(
+            dom = "t",
+            autoWidth = TRUE,
+            columnDefs = list(list(width = "200px", targets = "_all"))
+          )
+        ),
+        report = q[["table"]]
+      )
+    })
+
+    output$summary_table <- DT::renderDataTable(summary_table_r()[["html"]])
+
+    # slider text
+    output$ui_outlier_help <- renderUI({
+      req(input$method)
+      if (input$method == "IQR") {
+        req(input$iqr_slider)
+        tags$small(
+          withMathJax(
+            helpText(
+              "Outlier data points (\\(x \\lt Q1 - ", input$iqr_slider, "\\times IQR\\) or \\(
+            Q3 + ", input$iqr_slider, "\\times IQR \\lt x\\))
+            are displayed in red on the plot and can be visualized in the table below."
+            ),
+            if (input$split_outliers) {
+              withMathJax(helpText("Note: Quantiles are calculated per group."))
+            }
+          )
+        )
+      } else if (input$method == "Z-score") {
+        req(input$zscore_slider)
+        tags$small(
+          withMathJax(
+            helpText(
+              "Outlier data points (\\(Zscore(x) < -", input$zscore_slider,
+              "\\) or \\(", input$zscore_slider, "< Zscore(x) \\))
+              are displayed in red on the plot and can be visualized in the table below."
+            ),
+            if (input$split_outliers) {
+              withMathJax(helpText(" Note: Z-scores are calculated per group."))
+            }
+          )
+        )
+      } else if (input$method == "Percentile") {
+        req(input$percentile_slider)
+        tags$small(
+          withMathJax(
+            helpText(
+              "Outlier/extreme data points (\\( Percentile(x) <", input$percentile_slider,
+              "\\) or \\(", 1 - input$percentile_slider, " < Percentile(x) \\))
+            are displayed in red on the plot and can be visualized in the table below."
+            ),
+            if (input$split_outliers) {
+              withMathJax(helpText("Note: Percentiles are calculated per group."))
+            }
+          )
+        )
+      }
+    })
+
+    box_plot_r <- reactive({
+      teal::validate_inputs(iv_r())
+      req(decorated_q$box_plot())[["box_plot"]]
+    })
+    density_plot_r <- reactive({
+      teal::validate_inputs(iv_r())
+      req(decorated_q$density_plot())[["density_plot"]]
+    })
+    cumulative_plot_r <- reactive({
+      teal::validate_inputs(iv_r())
+      req(decorated_q$cumulative_plot())[["cumulative_plot"]]
+    })
+
+    box_pws <- teal.widgets::plot_with_settings_srv(
+      id = "box_plot",
+      plot_r = box_plot_r,
+      height = plot_height,
+      width = plot_width,
+      brushing = TRUE
+    )
+
+    density_pws <- teal.widgets::plot_with_settings_srv(
+      id = "density_plot",
+      plot_r = density_plot_r,
+      height = plot_height,
+      width = plot_width,
+      brushing = TRUE
+    )
+
+    cum_density_pws <- teal.widgets::plot_with_settings_srv(
+      id = "cum_density_plot",
+      plot_r = cumulative_plot_r,
+      height = plot_height,
+      width = plot_width,
+      brushing = TRUE
+    )
+
+    choices <- reactive(teal.transform::variable_choices(data_obj()[[dataname_first]]))
+
+    observeEvent(common_code_q(), {
+      ANL_OUTLIER <- common_code_q()[["ANL_OUTLIER"]]
+      teal.widgets::updateOptionalSelectInput(
+        session,
+        inputId = "table_ui_columns",
+        choices = dplyr::setdiff(choices(), names(ANL_OUTLIER)),
+        selected = restoreInput(ns("table_ui_columns"), isolate(input$table_ui_columns))
+      )
+    })
+
+    output$table_ui <- DT::renderDataTable(
+      expr = {
+        tab <- input$tabs
+        req(tab) # tab is NULL upon app launch, hence will crash without this statement
+        req(iv_r()$is_valid()) # Same validation as output$table_ui_wrap
+        outlier_var <- as.vector(merged$anl_input_r()$columns_source$outlier_var)
+        categorical_var <- as.vector(merged$anl_input_r()$columns_source$categorical_var)
+
+        ANL_OUTLIER <- common_code_q()[["ANL_OUTLIER"]]
+        ANL_OUTLIER_EXTENDED <- common_code_q()[["ANL_OUTLIER_EXTENDED"]]
+        ANL <- common_code_q()[["ANL"]]
+
+        plot_brush <- switch(current_tab_r(),
+          box_plot = {
+            box_plot_r()
+            box_pws$brush()
+          },
+          density_plot = {
+            density_plot_r()
+            density_pws$brush()
+          },
+          cumulative_plot = {
+            cumulative_plot_r()
+            cum_density_pws$brush()
+          }
+        )
+
+        # removing unused column ASAP
+        ANL_OUTLIER$order <- ANL$order <- NULL
+
+        display_table <- if (!is.null(plot_brush)) {
+          if (length(categorical_var) > 0) {
+            # due to reordering, the x-axis label may be changed to something like "reorder(categorical_var, order)"
+            if (tab == "Boxplot") {
+              plot_brush$mapping$x <- categorical_var
+            } else {
+              # the other plots use facetting
+              # so it is panelvar1 that gets relabelled to "reorder(categorical_var, order)"
+              plot_brush$mapping$panelvar1 <- categorical_var
+            }
+          } else {
+            if (tab == "Boxplot") {
+              # in boxplot with no categorical variable, there is no column in ANL that would correspond to x-axis
+              # so a column needs to be inserted with the value "Entire dataset" because that's the label used in plot
+              ANL[[plot_brush$mapping$x]] <- "Entire dataset"
+            }
+          }
+
+          # in density and cumulative plots, ANL does not have a column corresponding to y-axis.
+          # so they need to be computed and attached to ANL
+          if (tab == "Density Plot") {
+            plot_brush$mapping$y <- "density"
+            ANL$density <- plot_brush$ymin
+            # either ymin or ymax will work
+          } else if (tab == "Cumulative Distribution Plot") {
+            plot_brush$mapping$y <- "cdf"
+            if (length(categorical_var) > 0) {
+              ANL <- ANL %>%
+                dplyr::group_by(!!as.name(plot_brush$mapping$panelvar1)) %>%
+                dplyr::mutate(cdf = stats::ecdf(!!as.name(outlier_var))(!!as.name(outlier_var)))
+            } else {
+              ANL$cdf <- stats::ecdf(ANL[[outlier_var]])(ANL[[outlier_var]])
+            }
+          }
+
+          brushed_rows <- brushedPoints(ANL, plot_brush)
+          if (nrow(brushed_rows) > 0) {
+            # now we need to remove extra column from ANL so that it will have the same columns as ANL_OUTLIER
+            # so that dplyr::intersect will work
+            if (tab == "Density Plot") {
+              brushed_rows$density <- NULL
+            } else if (tab == "Cumulative Distribution Plot") {
+              brushed_rows$cdf <- NULL
+            } else if (tab == "Boxplot" && length(categorical_var) == 0) {
+              brushed_rows[[plot_brush$mapping$x]] <- NULL
+            }
+            # is_outlier_selected is part of ANL_OUTLIER so needed here
+            brushed_rows$is_outlier_selected <- TRUE
+            dplyr::intersect(ANL_OUTLIER, brushed_rows)
+          } else {
+            ANL_OUTLIER[0, ]
+          }
+        } else {
+          ANL_OUTLIER[ANL_OUTLIER$is_outlier_selected, ]
+        }
+
+        display_table$is_outlier_selected <- NULL
+
+        # Extend the brushed ANL_OUTLIER with additional columns
+        dplyr::left_join(
+          display_table,
+          dplyr::select(ANL_OUTLIER_EXTENDED, -"is_outlier_selected"),
+          by = names(display_table)
+        ) %>%
+          dplyr::select(union(names(display_table), input$table_ui_columns))
+      },
+      options = list(
+        searching = FALSE, language = list(
+          zeroRecords = "The brushed area does not contain outlier observations for the currently defined threshold"
+        ),
+        pageLength = input$table_ui_rows
+      )
+    )
+
+    output$total_outliers <- renderUI({
+      req(iv_r()$is_valid())
+      ANL <- merged$anl_q_r()[["ANL"]]
+      ANL_OUTLIER <- common_code_q()[["ANL_OUTLIER"]]
+      teal::validate_has_data(ANL, 1)
+      ANL_OUTLIER_SELECTED <- ANL_OUTLIER[ANL_OUTLIER$is_outlier_selected, ]
+      tags$h5(
+        sprintf(
+          "%s %d / %d [%.02f%%]",
+          "Total number of outlier(s):",
+          nrow(ANL_OUTLIER_SELECTED),
+          nrow(ANL),
+          100 * nrow(ANL_OUTLIER_SELECTED) / nrow(ANL)
+        )
+      )
+    })
+
+    output$total_missing <- renderUI({
+      if (n_outlier_missing() > 0) {
+        ANL <- merged$anl_q_r()[["ANL"]]
+        helpText(
+          sprintf(
+            "%s %d / %d [%.02f%%]",
+            "Total number of row(s) with missing values:",
+            n_outlier_missing(),
+            nrow(ANL),
+            100 * (n_outlier_missing()) / nrow(ANL)
+          )
+        )
+      }
+    })
+
+    output$table_ui_wrap <- renderUI({
+      req(iv_r()$is_valid())
+      tagList(
+        teal.widgets::optionalSelectInput(
+          inputId = ns("table_ui_columns"),
+          label = "Choose additional columns",
+          choices = NULL,
+          selected = NULL,
+          multiple = TRUE
+        ),
+        tags$h4("Outlier Table"),
+        teal.widgets::get_dt_rows(ns("table_ui"), ns("table_ui_rows"))
+      )
+    })
+
+    # Render R code.
+    source_code_r <- reactive(teal.code::get_code(req(decorated_final_q())))
+
+    teal.widgets::verbatim_popup_srv(
+      id = "rcode",
+      verbatim_content = source_code_r,
+      title = "Show R Code for Outlier"
+    )
+
+    ### REPORTER
+    if (with_reporter) {
+      card_fun <- function(comment, label) {
+        tab_type <- input$tabs
+        card <- teal::report_card_template(
+          title = paste0("Outliers - ", tab_type),
+          label = label,
+          with_filter = with_filter,
+          filter_panel_api = filter_panel_api
+        )
+        categorical_var <- as.vector(merged$anl_input_r()$columns_source$categorical_var)
+        if (length(categorical_var) > 0) {
+          card$append_text("Summary Table", "header3")
+          card$append_table(summary_table_r()[["report"]])
+        }
+        card$append_text("Plot", "header3")
+        if (tab_type == "Boxplot") {
+          card$append_plot(box_plot_r(), dim = box_pws$dim())
+        } else if (tab_type == "Density Plot") {
+          card$append_plot(density_plot_r(), dim = density_pws$dim())
+        } else if (tab_type == "Cumulative Distribution Plot") {
+          card$append_plot(cumulative_plot_r(), dim = cum_density_pws$dim())
+        }
+        if (!comment == "") {
+          card$append_text("Comment", "header3")
+          card$append_text(comment)
+        }
+        card$append_src(source_code_r())
+        card
+      }
+      teal.reporter::add_card_button_srv("add_reporter", reporter = reporter, card_fun = card_fun)
+    }
+    ###
+  })
+}
